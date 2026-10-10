@@ -14,6 +14,9 @@ output_column_dict = {
         "tb_per_sec",
         "backend",
         "resolved_backend",
+        # "" for a measured row; "skipped: ..." / "failed: ..." / "error: ..."
+        # for a backend or test line that produced no measurement.
+        "status",
     ],
     "attention": [
         "s_qo",
@@ -30,6 +33,7 @@ output_column_dict = {
         "random_actual_seq_len",
         "is_var_seq",
         "cute_dsl_impl",
+        "sparse_mla_top_k",
         "timing_metric",
         "row_activity_mode",
         "calls_per_sample",
@@ -39,6 +43,7 @@ output_column_dict = {
         "compressed_topk",
         "compressed_kv_len",
         "compressed_page_size",
+        "compress_ratio",
     ],
     "gemm": [
         "n",
@@ -68,6 +73,9 @@ output_column_dict = {
         "use_routing_scales_on_input",
         "weight_dtype",
         "activation_type",
+        "gemm1_alpha",
+        "gemm1_beta",
+        "gemm1_clamp_limit",
         "quant_variant",
         "autotune",
         "tactic",
@@ -262,6 +270,7 @@ benchmark_apis = {
         "cute_dsl_bf16_moe",
         "b12x_fused_moe",
         "alphamoe_nvfp4_aligned_moe",
+        "alphamoe_fp8_block_scale_aligned_moe",
         "unified_nvfp4_moe",
         "bgmv_moe",
     ],
@@ -341,6 +350,7 @@ benchmark_apis = {
     ],
     "kda": [
         "recurrent_kda_prefill",
+        "recurrent_kda_decode",
     ],
     "sparse_attention": [
         "MSAProxyScore",
@@ -561,11 +571,29 @@ routine_cc_to_supported_backends = {
         "8.6": ["fa2"],
         "8.9": ["fa2"],
         "9.0": ["fa2", "fa3"],
-        "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
-        "10.3": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
+        "10.0": [
+            "fa2",
+            "cutlass",
+            "cutile",
+            "trtllm-native",
+            "cute-dsl",
+            "auto",
+            "cake",
+            "prims-ts",
+        ],
+        "10.3": [
+            "fa2",
+            "cutlass",
+            "cutile",
+            "trtllm-native",
+            "cute-dsl",
+            "auto",
+            "cake",
+            "prims-ts",
+        ],
         "10.7": ["fa2", "cutlass", "trtllm-native"],
-        "12.0": ["fa2"],
-        "12.1": ["fa2"],
+        "12.0": ["fa2", "cutile", "xqa"],
+        "12.1": ["fa2", "cutile", "xqa"],
     },
     "trtllm_batch_decode_sparse_mla_dsv4": {
         "7.5": [],
@@ -573,33 +601,38 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["trtllm-gen"],
-        "10.3": ["trtllm-gen"],
+        "10.0": ["trtllm-gen", "cake", "cute-dsl-hca"],
+        "10.3": ["trtllm-gen", "cake", "cute-dsl-hca"],
         "10.7": [],
         "12.0": [],
         "12.1": [],
     },
     # GEMM
     "gemm_fp8_nt_groupwise": {
+        # NOTE: cake calls the Kimi-K3 FP8 projection (BF16 activations
+        # quantized in-call; prepare_kimi_k3_fp8_projection)
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cutlass"],
-        "10.3": ["cutlass"],
-        "10.7": ["cutlass"],
+        "10.0": ["cutlass", "trtllm", "cutile", "cake"],
+        "10.3": ["cutlass", "trtllm", "cutile", "cake"],
+        "10.7": ["cutlass", "trtllm"],
         "12.0": [],
         "12.1": [],
     },
     "group_gemm_fp8_nt_groupwise": {
+        # NOTE: cutlass is the API's default backend (named "trtllm" there)
+        # NOTE: cute-dsl calls group_gemm_fp8_nt_groupwise_contiguous
+        # NOTE: deepgemm calls group_deepgemm_fp8_nt_groupwise
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cutlass"],
-        "10.3": ["cutlass"],
+        "10.0": ["cutlass", "cutile", "cute-dsl", "deepgemm"],
+        "10.3": ["cutlass", "cutile", "cute-dsl"],
         "10.7": ["cutlass"],
         "12.0": [],
         "12.1": [],
@@ -622,8 +655,8 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cutlass", "cute-dsl", "trtllm", "cudnn"],
-        "10.3": ["cutlass", "cute-dsl", "trtllm", "cudnn"],
+        "10.0": ["cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn"],
+        "10.3": ["cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn"],
         "10.7": ["cutlass", "cute-dsl", "trtllm"],
         "11.0": ["cutlass", "cudnn"],
         "12.0": ["cutlass", "cudnn"],
@@ -727,6 +760,10 @@ routine_cc_to_supported_backends = {
         "12.1": ["b12x"],
     },
     "alphamoe_nvfp4_aligned_moe": {
+        "10.0": ["alphamoe"],
+        "10.3": ["alphamoe"],
+    },
+    "alphamoe_fp8_block_scale_aligned_moe": {
         "10.0": ["alphamoe"],
         "10.3": ["alphamoe"],
     },
@@ -1142,16 +1179,17 @@ routine_cc_to_supported_backends = {
         "12.1": ["cuda"],
     },
     "mla_rope_quantize_fp8": {
+        # NOTE: cutile calls rope_quantize_fp8(backend="cutile")
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": ["cuda"],
         "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
+        "10.0": ["cuda", "cutile"],
+        "10.3": ["cuda", "cutile"],
         "10.7": ["cuda"],
-        "12.0": ["cuda"],
-        "12.1": ["cuda"],
+        "12.0": ["cuda", "cutile"],
+        "12.1": ["cuda", "cutile"],
     },
     "rope_quantize_fp8": {
         "7.5": [],
@@ -1231,18 +1269,32 @@ routine_cc_to_supported_backends = {
         "12.0": [],
         "12.1": [],
     },
-    # KDA prefill on SM120a only. The SM100-family Cake prefill backend is a
-    # different kernel with a different contract and is not benchmarked here;
-    # listing it under 10.0/10.3 would put two unrelated implementations in one
-    # column.
+    # KDA prefill. The SM120a variants (decomp / fused) and the SM100-family
+    # routes (cute-dsl / cake / small-bh / cudnn) are different kernels, so
+    # each has its own backend name rather than sharing a column.
     "recurrent_kda_prefill": {
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["flashinfer"],
-        "10.3": [],
+        # NOTE: flashinfer-<name> calls recurrent_kda(backend=<name>)
+        "10.0": [
+            "flashinfer",
+            "flashinfer-cute-dsl",
+            "flashinfer-cute-dsl-persistent",
+            "flashinfer-cake",
+            "flashinfer-small-bh",
+            "flashinfer-cudnn",
+        ],
+        "10.3": [
+            "flashinfer",
+            "flashinfer-cute-dsl",
+            "flashinfer-cute-dsl-persistent",
+            "flashinfer-cake",
+            "flashinfer-small-bh",
+            "flashinfer-cudnn",
+        ],
         "10.7": [],
         "11.0": [],
         "12.0": [
@@ -1254,7 +1306,34 @@ routine_cc_to_supported_backends = {
         ],
         "12.1": [],
     },
+    "recurrent_kda_decode": {
+        # NOTE: flashinfer-<name> calls recurrent_kda(backend=<name>) with T=1
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["flashinfer", "flashinfer-cute-dsl"],
+        "10.3": ["flashinfer", "flashinfer-cute-dsl"],
+        "10.7": [],
+        "11.0": [],
+        "12.0": [],
+        "12.1": [],
+    },
 }
+
+
+# Backends that produced no measurement in the current test line, as
+# (backend, status) pairs. flashinfer_benchmark.run_test clears this before a
+# line and writes one output row per entry, so skipped and failed backends are
+# visible in the CSV instead of only in stdout.
+backend_statuses = []
+
+
+def record_backend_status(backend, status):
+    """Record that *backend* produced no measurement, with a reason."""
+    print(f"[WARNING] {backend}: {status}")
+    backend_statuses.append((backend, status))
 
 
 def filter_backends_by_compute_capability(backends, routine, device):
@@ -1272,8 +1351,9 @@ def filter_backends_by_compute_capability(backends, routine, device):
             backends_to_remove.append(backend)
     for backend in backends_to_remove:
         backends.remove(backend)
-        print(
-            f"[WARNING] {backend} for routine {routine} is not supported on compute capability {compute_capability}. Skipping."
+        record_backend_status(
+            backend,
+            f"skipped: not supported for routine {routine} on compute capability {compute_capability}",
         )
     return backends
 

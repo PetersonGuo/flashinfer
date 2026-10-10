@@ -15,14 +15,20 @@ except ImportError:
 
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
+    alphamoe_fp8_block_scale_aligned_moe,
+    alphamoe_interleave_gated_weights,
     alphamoe_nvfp4_aligned_moe,
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
     cutlass_fused_moe,
-    fused_topk_deepseek,
 )
-from flashinfer.tllm_enums import RoutingMethodType, is_gated_activation
+from flashinfer.tllm_enums import (
+    DEFAULT_SITU_BETA,
+    DEFAULT_SITU_LINEAR_BETA,
+    RoutingMethodType,
+    is_gated_activation,
+)
 from flashinfer import fp4_quantize, mxfp8_quantize
 from flashinfer.tllm_enums import SfLayout
 from flashinfer.testing.utils import (
@@ -104,6 +110,8 @@ def run_moe_test(args):
         return testB12xFusedMoe(args)
     elif args.routine == "alphamoe_nvfp4_aligned_moe":
         return testAlphaMoeNvfp4AlignedMoe(args)
+    elif args.routine == "alphamoe_fp8_block_scale_aligned_moe":
+        return testAlphaMoeFp8BlockScaleAlignedMoe(args)
     elif args.routine == "bgmv_moe":
         return testBgmvMoe(args)
     elif args.routine == "unified_nvfp4_moe":
@@ -232,6 +240,23 @@ def parse_moe_args(line, parser):
         default=ActivationType.Swiglu,
         help=f"Type of activation function: {[e.name for e in ActivationType]}",
     )
+    for name, what in (
+        ("alpha", "alpha (SwiGLU) / gate tanh scale (SiTU)"),
+        ("beta", "beta (SwiGLU) / linear tanh scale (SiTU)"),
+        ("clamp_limit", "clamp limit"),
+    ):
+        parser.add_argument(
+            f"--gemm1_{name}",
+            type=float,
+            required=False,
+            default=None,
+            help=(
+                f"Per-expert gemm1 activation {what} for trtllm_fp4_block_scale_moe. "
+                "Unset passes None (kernel default), except that SiTU defaults to "
+                f"SiTU()'s gate/linear scales {DEFAULT_SITU_BETA:g}/"
+                f"{DEFAULT_SITU_LINEAR_BETA:g} (None would run SiTU with 1/1)."
+            ),
+        )
     parser.add_argument(
         "--autotune",
         action="store_true",
@@ -376,6 +401,7 @@ def create_trtllm_moe_test_data(
     weight_dtype: torch.dtype,
     device: torch.device,
     moe_kernel_type: str = "fp8_per_tensor",
+    local_num_experts: Optional[int] = None,
 ):
     """
     Create test data for TensorRT-LLM fused MoE benchmarking (trtllm_*_moe APIs).
@@ -384,6 +410,9 @@ def create_trtllm_moe_test_data(
     flashinfer.fused_moe (e.g., trtllm_fp4_block_scale_moe, trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe). It is NOT used for CUTLASS MoE benchmarks,
     which construct their own inputs specific to the CUTLASS path.
+
+    Routing logits/bias cover all num_experts; weights cover only the
+    local_num_experts experts on this rank (default: all of them).
 
     Returns:
         Tuple of tensors needed for trtllm fused MoE computation
@@ -429,7 +458,11 @@ def create_trtllm_moe_test_data(
 
     # Create weights - always start with bfloat16 for proper quantization
     gemm1_weights, gemm2_weights = generate_moe_weights(
-        num_experts, hidden_size, intermediate_size, device, dtype=torch.bfloat16
+        local_num_experts or num_experts,
+        hidden_size,
+        intermediate_size,
+        device,
+        dtype=torch.bfloat16,
     )
 
     return routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights
@@ -461,40 +494,69 @@ def _compute_routing_for_method(
         selected_experts: [num_tokens, top_k] tensor of selected expert indices
     """
     num_tokens = routing_logits.shape[0]
-    device = routing_logits.device
 
     if routing_method_type == RoutingMethodType.DeepSeekV3:
-        # Use fused_topk_deepseek for accurate DeepSeekV3 routing
+        # DeepSeekV3 no-aux-loss routing in plain torch: sigmoid(logits) + bias,
+        # keep the topk_group groups with the best top-2 sums, top-k inside them.
+        # This only counts active experts for TB/s accounting, so it avoids
+        # fused_topk_deepseek, which rejects vLLM's n_group = topk_group = 1
+        # that the MoE kernels themselves accept.
         if n_group is None or topk_group is None or routed_scaling_factor is None:
             raise ValueError(
                 "DeepSeekV3 routing requires n_group, topk_group, and routed_scaling_factor"
             )
-        if routing_bias is None:
-            routing_bias = torch.zeros(
-                routing_logits.shape[1], device=device, dtype=routing_logits.dtype
+        scores = torch.sigmoid(routing_logits.float())
+        if routing_bias is not None:
+            scores = scores + routing_bias.float()
+        if n_group > 1:
+            grouped = scores.view(num_tokens, n_group, -1)
+            group_scores = grouped.topk(2, dim=-1).values.sum(dim=-1)
+            top_groups = group_scores.topk(topk_group, dim=-1).indices
+            group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+            group_mask.scatter_(1, top_groups, True)
+            scores = grouped.masked_fill(~group_mask[..., None], float("-inf")).view(
+                num_tokens, -1
             )
-
-        # Allocate output tensors
-        topk_values = torch.empty(num_tokens, top_k, device=device, dtype=torch.float32)
-        topk_indices = torch.empty(num_tokens, top_k, device=device, dtype=torch.int32)
-
-        fused_topk_deepseek(
-            scores=routing_logits.float(),
-            bias=routing_bias.float(),
-            n_group=n_group,
-            topk_group=topk_group,
-            topk=top_k,
-            routed_scaling_factor=routed_scaling_factor,
-            topk_values=topk_values,
-            topk_indices=topk_indices,
-        )
-        return topk_indices
+        return scores.topk(top_k, dim=-1).indices.to(torch.int32)
     else:
         # For other routing methods, use simple top-k as approximation
         # This is accurate for Default, Renormalize, RenormalizeNaive, TopK
         # and approximate for Llama4
         _, selected_experts = compute_routing(routing_logits.float(), top_k)
         return selected_experts
+
+
+def _gemm1_activation_params(args, local_num_experts: int, device: torch.device):
+    """Per-local-expert (gemm1_alpha, gemm1_beta, gemm1_clamp_limit) tensors or None.
+
+    The TRT-LLM kernels treat None SiTU scales as 1/1, not SiTU()'s defaults, so
+    SiTU falls back to DEFAULT_SITU_BETA / DEFAULT_SITU_LINEAR_BETA here.
+    """
+    alpha, beta = args.gemm1_alpha, args.gemm1_beta
+    if args.activation_type == ActivationType.Situ:
+        alpha = DEFAULT_SITU_BETA if alpha is None else alpha
+        beta = DEFAULT_SITU_LINEAR_BETA if beta is None else beta
+    return tuple(
+        None
+        if value is None
+        else torch.full((local_num_experts,), value, dtype=torch.float32, device=device)
+        for value in (alpha, beta, args.gemm1_clamp_limit)
+    )
+
+
+def _local_routing_counts(
+    selected_experts: torch.Tensor, local_expert_offset: int, local_num_experts: int
+) -> tuple[int, int]:
+    """(token-expert pairs, distinct experts) routed to this rank's local experts.
+
+    Under expert parallelism the kernel computes only these pairs and reads only
+    these experts' weights, so FLOPs and bytes must be counted from them.
+    """
+    is_local = (selected_experts >= local_expert_offset) & (
+        selected_experts < local_expert_offset + local_num_experts
+    )
+    local = selected_experts[is_local]
+    return local.numel(), int(local.unique().numel())
 
 
 def testTrtllmFp4BlockScaleMoe(args):
@@ -583,6 +645,7 @@ def testTrtllmFp4BlockScaleMoe(args):
             weight_dtype,
             device,
             moe_kernel_type="fp4_block_scale",
+            local_num_experts=local_num_experts,
         )
     )
 
@@ -611,10 +674,10 @@ def testTrtllmFp4BlockScaleMoe(args):
 
     # Quantize weights using proper FP4 quantization
     gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes, gemm1_scales_global = (
-        quantize_fp4_batched(gemm1_weights, num_experts, use_ue8m0, True)
+        quantize_fp4_batched(gemm1_weights, local_num_experts, use_ue8m0, True)
     )
     gemm2_weights_fp4_bytes, gemm2_scales_fp4_bytes, gemm2_scales_global = (
-        quantize_fp4_batched(gemm2_weights, num_experts, use_ue8m0, True)
+        quantize_fp4_batched(gemm2_weights, local_num_experts, use_ue8m0, True)
     )
 
     # Prepare hidden states and scale based on fp4_mode
@@ -671,23 +734,23 @@ def testTrtllmFp4BlockScaleMoe(args):
         return (n + 3) // 4 * 4
 
     gemm1_weights_fp4 = gemm1_weights_fp4_bytes.view(torch.uint8).reshape(
-        num_experts, 2 * intermediate_size, hidden_size // 2
+        local_num_experts, 2 * intermediate_size, hidden_size // 2
     )
     gemm1_weights_scale = gemm1_scales_fp4_bytes.view(torch.float8_e4m3fn).reshape(
-        num_experts, _sf_outer(2 * intermediate_size), _sf_inner(hidden_size)
+        local_num_experts, _sf_outer(2 * intermediate_size), _sf_inner(hidden_size)
     )
 
     gemm2_weights_fp4 = gemm2_weights_fp4_bytes.view(torch.uint8).reshape(
-        num_experts, hidden_size, intermediate_size // 2
+        local_num_experts, hidden_size, intermediate_size // 2
     )
     gemm2_weights_scale = gemm2_scales_fp4_bytes.view(torch.float8_e4m3fn).reshape(
-        num_experts, _sf_outer(hidden_size), _sf_inner(intermediate_size)
+        local_num_experts, _sf_outer(hidden_size), _sf_inner(intermediate_size)
     )
 
     gemm1_bias = None
-    gemm1_alpha = None
-    gemm1_beta = None
-    gemm1_clamp_limit = None
+    gemm1_alpha, gemm1_beta, gemm1_clamp_limit = _gemm1_activation_params(
+        args, local_num_experts, device
+    )
     gemm2_bias = None
 
     # Create scale scalars using shared utility
@@ -805,14 +868,17 @@ def testTrtllmFp4BlockScaleMoe(args):
     # Compute performance metrics
     median_time = np.median(times)
     std_time = np.std(times)
+    local_pairs, local_active_experts = _local_routing_counts(
+        selected_experts, local_expert_offset, local_num_experts
+    )
     tflops = calculate_moe_tflops(
-        num_tokens,
+        local_pairs,  # token-expert pairs computed on this rank
         hidden_size,
         intermediate_size,
         num_experts,
-        top_k,
+        1,  # top_k: local_pairs already counts every route
         median_time,
-        is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
+        is_gated=is_gated_activation(args.activation_type),
     )
     input_format_str = {"nvfp4": "nvfp4", "mxfp4_mxfp8": "mxfp8", "mxfp4_bf16": "bf16"}[
         fp4_mode
@@ -830,9 +896,9 @@ def testTrtllmFp4BlockScaleMoe(args):
         input_format=input_format_str,
         weight_format=weight_format_str,
         routing_logits_dtype=routing_logits.dtype,
-        active_experts=int(selected_experts.unique().numel()),
+        active_experts=local_active_experts,
         verbose=args.verbose,
-        is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
+        is_gated=is_gated_activation(args.activation_type),
     )
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
@@ -864,6 +930,8 @@ def testTrtllmFp4BlockScaleMoe(args):
         cur_res["weight_dtype"] = weight_dtype
         cur_res["activation_type"] = args.activation_type.name
         cur_res["fp4_mode"] = fp4_mode
+        cur_res["gemm1_alpha"] = "" if gemm1_alpha is None else gemm1_alpha[0].item()
+        cur_res["gemm1_beta"] = "" if gemm1_beta is None else gemm1_beta[0].item()
         res.append(cur_res)
 
     return res
@@ -1835,6 +1903,213 @@ def testAlphaMoeNvfp4AlignedMoe(args):
     return result_rows
 
 
+def _fp8_quantize_groups(values: torch.Tensor, group_shape: tuple[int, int]):
+    """E4M3-quantize [..., rows, cols] in (group_rows x group_cols) blocks.
+
+    Returns (fp8 values, float32 scales [..., rows / group_rows, cols / group_cols]).
+    """
+    *lead, rows, cols = values.shape
+    gr, gc = group_shape
+    blocks = values.float().reshape(*lead, rows // gr, gr, cols // gc, gc)
+    scales = blocks.abs().amax(dim=(-3, -1)).clamp_min(1e-8) / FLOAT8_E4M3_MAX
+    quantized = (blocks / scales[..., :, None, :, None]).clamp(
+        -FLOAT8_E4M3_MAX, FLOAT8_E4M3_MAX
+    )
+    return (
+        quantized.to(torch.float8_e4m3fn).reshape(values.shape).contiguous(),
+        scales.contiguous(),
+    )
+
+
+def _fp8_dequantize_groups(values: torch.Tensor, scales: torch.Tensor, group_shape):
+    gr, gc = group_shape
+    return values.float() * scales.repeat_interleave(gr, dim=-2).repeat_interleave(
+        gc, dim=-1
+    )
+
+
+def testAlphaMoeFp8BlockScaleAlignedMoe(args):
+    """Benchmark the SM100/SM103 AlphaMoE W8A8 FP8 block-scale megakernel.
+
+    Activations use per-token 1x128 scales, weights 128x128 block scales
+    (DeepSeek FP8); routing is a pre-aligned block_m plan, as for the NVFP4
+    AlphaMoE routine.
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testAlphaMoeFp8BlockScaleAlignedMoe")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+    warn_if_pdl_unsupported(args, args.routine)
+    device = get_device(args)
+    backends = filter_backends_by_compute_capability(["alphamoe"], args.routine, device)
+    if not backends:
+        print("[ERROR] No backends to test. Exiting.")
+        return []
+
+    num_tokens = args.num_tokens
+    hidden_size = args.hidden_size
+    intermediate_size = args.intermediate_size
+    num_experts = args.num_experts
+    top_k = args.top_k
+    block_m = args.block_m
+    if args.activation_type != ActivationType.Swiglu:
+        raise ValueError(f"{args.routine} supports only Swiglu")
+    if args.local_expert_offset != 0 or (
+        args.local_num_experts is not None and args.local_num_experts != num_experts
+    ):
+        raise ValueError(f"{args.routine} does not shard experts")
+    if hidden_size % 128 or intermediate_size % 128:
+        raise ValueError("hidden_size and intermediate_size must be divisible by 128")
+    if not 1 <= top_k <= num_experts:
+        raise ValueError("top_k must be in [1, num_experts]")
+    if block_m < 8 or block_m % 8:
+        raise ValueError("block_m must be at least 8 and divisible by 8")
+
+    torch.manual_seed(args.random_seed)
+    hidden = 0.25 * torch.randn(num_tokens, hidden_size, device=device)
+    x, x_scale = _fp8_quantize_groups(hidden, (1, 128))
+    w1, w1_scale = _fp8_quantize_groups(
+        0.125
+        * torch.randn(num_experts, 2 * intermediate_size, hidden_size, device=device),
+        (128, 128),
+    )
+    w2, w2_scale = _fp8_quantize_groups(
+        0.125 * torch.randn(num_experts, hidden_size, intermediate_size, device=device),
+        (128, 128),
+    )
+    w1_dev, w1_scale_dev = alphamoe_interleave_gated_weights(w1, w1_scale)
+    topk_ids = (
+        torch.randn(num_tokens, num_experts, device=device)
+        .topk(top_k, dim=-1)
+        .indices.to(torch.int32)
+    )
+    topk_weights = torch.softmax(torch.randn(num_tokens, top_k, device=device), dim=-1)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = _make_alphamoe_tight_plan(
+        topk_ids, block_m=block_m, num_experts=num_experts
+    )
+    out = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+    input_args = (
+        x,
+        x_scale,
+        w1_dev,
+        w1_scale_dev,
+        w2,
+        w2_scale,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        out,
+    )
+
+    def run_alphamoe(*tensors):
+        (*kernel_inputs, out) = tensors
+        return alphamoe_fp8_block_scale_aligned_moe(
+            *kernel_inputs,
+            top_k=top_k,
+            block_m=block_m,
+            routed_scaling_factor=args.routed_scaling_factor,
+            out=out,
+        )
+
+    if args.refcheck:
+        x_ref = _fp8_dequantize_groups(x, x_scale, (1, 128))
+        expected = torch.zeros(num_tokens, hidden_size, device=device)
+        for expert in topk_ids.unique().tolist():
+            tokens, slots = torch.where(topk_ids == expert)
+            gate, up = (
+                x_ref[tokens]
+                @ _fp8_dequantize_groups(w1[expert], w1_scale[expert], (128, 128)).T
+            ).chunk(2, dim=-1)
+            act_q, act_scale = _fp8_quantize_groups(
+                torch.nn.functional.silu(gate) * up, (1, 128)
+            )
+            down = (
+                _fp8_dequantize_groups(act_q, act_scale, (1, 128))
+                @ _fp8_dequantize_groups(w2[expert], w2_scale[expert], (128, 128)).T
+            )
+            expected.index_add_(
+                0,
+                tokens,
+                down * topk_weights[tokens, slots, None] * args.routed_scaling_factor,
+            )
+        out.zero_()
+        actual = run_alphamoe(*input_args).float()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.1)
+
+    # The kernel accumulates into out. As for the NVFP4 routine, zero it once
+    # outside the timed window so only the megakernel is measured.
+    out.zero_()
+    times = bench_gpu_time(
+        fn=run_alphamoe,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        sleep_after_run=False,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=not args.no_cuda_graph,
+        cold_l2_cache=True,
+        input_args=input_args,
+    )
+    median_time = np.median(times)
+    std_time = np.std(times)
+    tflops = calculate_moe_tflops(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        median_time,
+        is_gated=True,
+    )
+    tb_per_sec = calculate_moe_kernel_bandwidth(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        median_time,
+        torch.bfloat16,
+        torch.bfloat16,
+        input_format="fp8_block_scale",
+        weight_format="fp8_block_scale",
+        routing_logits_dtype=None,
+        active_experts=int(topk_ids.unique().numel()),
+        verbose=args.verbose,
+        is_gated=True,
+    )
+    print_perf_metrics("alphamoe", median_time, std_time, tflops, tb_per_sec)
+
+    result_rows = []
+    if args.output_path is not None:
+        row = defaultdict(str)
+        row.update(
+            routine=args.routine,
+            median_time=median_time,
+            std_time=std_time,
+            tflops=tflops,
+            tb_per_sec=tb_per_sec,
+            backend="alphamoe",
+            resolved_backend="alphamoe",
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            block_m=block_m,
+            routed_scaling_factor=args.routed_scaling_factor,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routing_method="prealigned",
+            input_dtype="fp8_e4m3",
+            weight_dtype="fp8_e4m3",
+            activation_type=ActivationType.Swiglu.name,
+            refcheck_passed=args.refcheck or "",
+            cold_l2_cache=True,
+        )
+        result_rows.append(row)
+    return result_rows
+
+
 def testCuteDslFp4BlockScaleMoe(args):
     """
     Test cute_dsl_fp4_block_scale_moe (CuTe DSL NVFP4 MoE on SM100/SM103).
@@ -2745,6 +3020,7 @@ def testTrtllmFp8BlockScaleMoe(args):
             weight_dtype,
             device,
             moe_kernel_type="fp8_block_scale",
+            local_num_experts=local_num_experts,
         )
     )
 
@@ -2769,7 +3045,7 @@ def testTrtllmFp8BlockScaleMoe(args):
     if use_shuffled_weight:
         gemm1_weights_fp8_shuffled = []
         gemm2_weights_fp8_shuffled = []
-        for i in range(num_experts):
+        for i in range(local_num_experts):
             tmp_w1 = process_fp8_weight_layout(
                 gemm1_weights_fp8[i], use_shuffled_weight, weight_layout
             )
@@ -2795,12 +3071,12 @@ def testTrtllmFp8BlockScaleMoe(args):
         (hidden_size // 128, num_tokens), device=device, dtype=torch.float32
     )
     gemm1_weights_scale = 2.0 * torch.ones(
-        (num_experts, 2 * intermediate_size // 128, hidden_size // 128),
+        (local_num_experts, 2 * intermediate_size // 128, hidden_size // 128),
         device=device,
         dtype=torch.float32,
     )
     gemm2_weights_scale = 2.0 * torch.ones(
-        (num_experts, hidden_size // 128, intermediate_size // 128),
+        (local_num_experts, hidden_size // 128, intermediate_size // 128),
         device=device,
         dtype=torch.float32,
     )
@@ -2872,14 +3148,17 @@ def testTrtllmFp8BlockScaleMoe(args):
     # Compute performance metrics
     median_time = np.median(times)
     std_time = np.std(times)
+    local_pairs, local_active_experts = _local_routing_counts(
+        selected_experts, local_expert_offset, local_num_experts
+    )
     tflops = calculate_moe_tflops(
-        num_tokens,
+        local_pairs,  # token-expert pairs computed on this rank
         hidden_size,
         intermediate_size,
         num_experts,
-        top_k,
+        1,  # top_k: local_pairs already counts every route
         median_time,
-        is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
+        is_gated=is_gated_activation(args.activation_type),
     )
     tb_per_sec = calculate_moe_kernel_bandwidth(
         num_tokens,
@@ -2893,7 +3172,7 @@ def testTrtllmFp8BlockScaleMoe(args):
         input_format="fp8",
         weight_format="fp8",
         routing_logits_dtype=routing_logits.dtype,
-        active_experts=int(selected_experts.unique().numel()),
+        active_experts=local_active_experts,
         verbose=args.verbose,
     )
 
@@ -3013,6 +3292,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             weight_dtype,
             device,
             moe_kernel_type="fp8_per_tensor",
+            local_num_experts=local_num_experts,
         )
     )
 
@@ -3108,14 +3388,17 @@ def testTrtllmFp8PerTensorScaleMoe(args):
     # Compute performance metrics
     median_time = np.median(times)
     std_time = np.std(times)
+    local_pairs, local_active_experts = _local_routing_counts(
+        selected_experts, local_expert_offset, local_num_experts
+    )
     tflops = calculate_moe_tflops(
-        num_tokens,
+        local_pairs,  # token-expert pairs computed on this rank
         hidden_size,
         intermediate_size,
         num_experts,
-        top_k,
+        1,  # top_k: local_pairs already counts every route
         median_time,
-        is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
+        is_gated=is_gated_activation(args.activation_type),
     )
     tb_per_sec = calculate_moe_kernel_bandwidth(
         num_tokens,
@@ -3129,7 +3412,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         input_format="fp8",
         weight_format="fp8",
         routing_logits_dtype=routing_logits.dtype,
-        active_experts=int(selected_experts.unique().numel()),
+        active_experts=local_active_experts,
         verbose=args.verbose,
     )
 

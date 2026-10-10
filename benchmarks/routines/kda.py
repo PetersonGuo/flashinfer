@@ -46,7 +46,17 @@ HEAD_DIM = 128
 #: dependency of this file, and a missing one is an explicit skip rather than a
 #: silent omission -- a comparison table with a quietly absent baseline is
 #: worse than one with a gap in it.
-_FLASHINFER_BACKENDS = ("flashinfer", "flashinfer-decomp", "flashinfer-fused")
+#: ``flashinfer-<name>`` pins ``recurrent_kda(backend=<name>)`` (the SM100 /
+#: SM103 cute-dsl, Cake, small-BH and cuDNN prefill routes).
+_API_BACKENDS = {
+    "flashinfer": "auto",
+    "flashinfer-cute-dsl": "cute-dsl",
+    "flashinfer-cute-dsl-persistent": "cute-dsl-persistent",
+    "flashinfer-cake": "cake",
+    "flashinfer-small-bh": "small-bh",
+    "flashinfer-cudnn": "cudnn",
+}
+_FLASHINFER_BACKENDS = tuple(_API_BACKENDS) + ("flashinfer-decomp", "flashinfer-fused")
 _EXTERNAL_BACKENDS = ("cutekda", "flash-kda")
 
 
@@ -54,6 +64,8 @@ def run_kda_test(args):
     """Route a KDA benchmark case to its routine."""
     if args.routine == "recurrent_kda_prefill":
         return testRecurrentKDAPrefill(args)
+    if args.routine == "recurrent_kda_decode":
+        return testRecurrentKDADecode(args)
     raise ValueError(f"Unsupported routine: {args.routine}")
 
 
@@ -79,7 +91,8 @@ def parse_kda_args(line, parser):
         required=True,
         help="Tokens per sequence. With --packed the sequences are packed into "
         "one [1, B * T, H, 128] activation and given explicit offsets; "
-        "without it they are a fixed [B, T, H, 128] batch.",
+        "without it they are a fixed [B, T, H, 128] batch. "
+        "recurrent_kda_decode requires 1.",
     )
     parser.add_argument(
         "--num_q_heads",
@@ -292,16 +305,18 @@ def _reference_prefill(inputs, args, device):
     return out.reshape_as(q), state
 
 
-def _flashinfer_runner(inputs, args, output, final_state, variant):
-    """A zero-argument callable running one FlashInfer backend.
+def _flashinfer_runner(inputs, args, output, final_state, variant, api_backend="auto"):
+    """A callable running one FlashInfer backend.
 
-    ``variant is None`` is the public entry point, policy and all. The other
-    two go through the internal entry so a report can show what the policy
-    chose and what it declined; they are not a second public API.
+    ``variant is None`` is the public entry point with ``backend=api_backend``
+    (``"auto"`` is the policy and all); its callable takes an optional
+    ``prefill_workspace`` for CUDA-graph capture. The SM120 variants go through
+    the internal entry so a report can show what the policy chose and what it
+    declined; they are not a second public API.
     """
     if variant is None:
 
-        def call():
+        def call(workspace=None):
             flashinfer.recurrent_kda(
                 q=inputs["q"],
                 k=inputs["k"],
@@ -318,6 +333,8 @@ def _flashinfer_runner(inputs, args, output, final_state, variant):
                 initial_state=inputs["initial_state"],
                 output_final_state=final_state is not None,
                 output=output,
+                prefill_workspace=workspace,
+                backend=api_backend,
             )
 
         return call
@@ -350,6 +367,26 @@ def _flashinfer_runner(inputs, args, output, final_state, variant):
         )
 
     return call
+
+
+def _capture_graph(call, device):
+    """Capture one public-API call into a CUDA graph and return its replay.
+
+    recurrent_kda needs a caller-owned RecurrentKDAPrefillWorkspace that is
+    warmed eagerly on the capture stream before capture, which
+    bench_gpu_time's own capture cannot do; so the routine captures one call
+    here and times ``graph.replay`` (a single launch) with CUDA events.
+    """
+    workspace = flashinfer.RecurrentKDAPrefillWorkspace(device)
+    stream = torch.cuda.Stream(device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        call(workspace)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        call(workspace)
+    return graph.replay
 
 
 def _external_runner(backend, inputs, args, output, final_state):
@@ -523,13 +560,32 @@ def testRecurrentKDAPrefill(args):
     )
 
     for backend in backends:
+        # Public-API backends are captured into a CUDA graph (cuDNN takes no
+        # prefill_workspace); the SM120 variants and external baselines are
+        # timed eagerly.
+        use_graph = (
+            not args.no_cuda_graph
+            and backend in _API_BACKENDS
+            and backend != "flashinfer-cudnn"
+        )
         if backend in _FLASHINFER_BACKENDS:
             variant = {
-                "flashinfer": None,
                 "flashinfer-decomp": "decomp",
                 "flashinfer-fused": "fused",
-            }[backend]
-            runner = _flashinfer_runner(inputs, args, output, final_state, variant)
+            }.get(backend)
+            runner_inputs = inputs
+            if use_graph and inputs["cu_seqlens"] is not None:
+                # Packed capture requires int64 offsets (eager calls make the
+                # same canonical copy internally).
+                runner_inputs = dict(inputs, cu_seqlens=inputs["cu_seqlens"].long())
+            runner = _flashinfer_runner(
+                runner_inputs,
+                args,
+                output,
+                final_state,
+                variant,
+                _API_BACKENDS.get(backend, "auto"),
+            )
         else:
             runner = _external_runner(backend, inputs, args, output, final_state)
         if runner is None:
@@ -541,6 +597,11 @@ def testRecurrentKDAPrefill(args):
         try:
             if initial_state_snapshot is not None:
                 inputs["initial_state"].copy_(initial_state_snapshot)
+            if use_graph:
+                runner = _capture_graph(runner, device)
+                if initial_state_snapshot is not None:
+                    inputs["initial_state"].copy_(initial_state_snapshot)
+                output.zero_()  # the checked output must come from the replay
             runner()
             torch.cuda.synchronize()
         except Exception as exc:  # noqa: BLE001 -- reported and skipped
@@ -555,16 +616,10 @@ def testRecurrentKDAPrefill(args):
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
             enable_cupti=args.use_cupti,
-            # CUDA-event timing, not graph-replay timing, and not because graphs
-            # do not work here -- they do, and the test suite captures every
-            # published combination. They need a protocol this harness cannot
-            # follow: a caller-owned RecurrentKDAPrefillWorkspace, warmed
-            # eagerly on the *capture* stream with the exact tensors, then a
-            # sync before capture. ``bench_gpu_time`` owns the stream and warms
-            # on its own, so a capture from here starts cold on a stream the
-            # backend has never seen, and the first thing it needs is an
-            # allocation. Timing the eager path is the honest measurement of
-            # what this harness is actually able to set up.
+            # Never bench_gpu_time's capture: recurrent_kda needs a
+            # caller-owned workspace warmed on the capture stream first, so
+            # graph backends were captured above (_capture_graph) and their
+            # runner is already a graph replay.
             use_cuda_graph=False,
         )
 
@@ -635,7 +690,139 @@ def testRecurrentKDAPrefill(args):
                 selected_variant if backend == "flashinfer" else backend
             )
             cur_res["kda_variant_policy"] = policy_source
+
             cur_res["sm_count"] = sm_count
+            cur_res["case_tag"] = args.case_tag
+            res.append(cur_res)
+    return res
+
+
+def testRecurrentKDADecode(args):
+    """Time recurrent_kda single-token decode (T=1) over a vLLM-style state pool.
+
+    Packed [1, B, H, 128] rows with cu_seqlens, a bfloat16 state pool with a
+    null slot 0 (row b uses slot b + 1), updated in place on every call.
+
+    Returns:
+        list[dict]: one row per backend.
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testRecurrentKDADecode")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: "
+            f"{args.repro_command}"
+        )
+    res = []
+    if args.s_qo != 1 or args.head_size != HEAD_DIM:
+        print(f"[ERROR] KDA decode needs --s_qo 1 and head_size={HEAD_DIM}. Exiting.")
+        return res
+    backends = [b for b in args.backends if b in _API_BACKENDS]
+    for backend in set(args.backends) - set(backends):
+        print(f"[INFO] {backend} has no recurrent_kda decode path. Skipping.")
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    num_seqs, num_heads, head_size = args.batch_size, args.num_q_heads, args.head_size
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    args.packed, args.has_initial_state = True, True  # decode contract
+    inputs = _make_inputs(args, device)
+    inputs["cu_seqlens"] = inputs["cu_seqlens"].int()
+    # State pool with a null slot 0; decode row b uses slot b + 1.
+    state_pool = torch.cat(
+        [torch.zeros_like(inputs["initial_state"][:1]), inputs["initial_state"]]
+    )
+    state_indices = torch.arange(1, num_seqs + 1, dtype=torch.int32, device=device)
+    pool_snapshot = state_pool.clone()
+    output = torch.empty_like(inputs["v"])
+
+    def run_backend(backend):
+        return flashinfer.recurrent_kda(
+            q=inputs["q"],
+            k=inputs["k"],
+            v=inputs["v"],
+            g=inputs["g"],
+            beta=inputs["beta"],
+            A_log=inputs["A_log"],
+            dt_bias=inputs["dt_bias"].reshape(-1),  # decode takes [H * K]
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            beta_is_logit=True,
+            lower_bound=args.lower_bound,
+            cu_seqlens=inputs["cu_seqlens"],
+            initial_state=state_pool,
+            ssm_state_indices=state_indices,
+            output=output,
+            backend=_API_BACKENDS[backend],
+        )
+
+    reference_output = None
+    if args.refcheck:
+        reference_output, _ = _reference_prefill(inputs, args, device)
+
+    backend_times = {}
+    for backend in backends:
+        state_pool.copy_(pool_snapshot)
+        try:
+            run_backend(backend)
+            torch.cuda.synchronize()
+        except Exception as exc:  # noqa: BLE001 -- reported and skipped
+            print(f"[ERROR] backend {backend} failed to run: {exc}")
+            continue
+        if reference_output is not None:
+            num_diff, num_elements, pct = is_close_stats(
+                reference_output.float(), output.float(), rtol=1e-2, atol=1e-2
+            )
+            if pct > 0.01:
+                print(
+                    f"[ERROR] Output tensor mismatch from backend {backend}: "
+                    f"{num_diff}/{num_elements} ({pct:.4f}%) elements differ"
+                )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(f"[ERROR] Backend {backend} output mismatch")
+            elif args.verbose >= 1:
+                print(f"[REFCHECK] Backend {backend}: PASSED")
+        backend_times[backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=not args.no_cuda_graph,
+            input_args=(backend,),
+        )
+
+    problem_flops = kda_prefill_flops(num_seqs, num_heads, head_size)
+    # Activations in/out plus the state slot read and written back.
+    problem_bytes = kda_prefill_bytes(
+        num_seqs, num_seqs, num_heads, head_size, input_dtype, True, True
+    )
+    for backend, times in backend_times.items():
+        median_time = np.median(times)
+        std_time = np.std(times)
+        tflops = problem_flops / (10**9 * median_time)
+        tb_per_sec = problem_bytes / (10**9 * median_time)
+        print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+        if args.output_path is not None:
+            cur_res = defaultdict(str)
+            cur_res["routine"] = args.routine
+            cur_res["median_time"] = median_time
+            cur_res["std_time"] = std_time
+            cur_res["tflops"] = tflops
+            cur_res["tb_per_sec"] = tb_per_sec
+            cur_res["backend"] = backend
+            cur_res["batch_size"] = num_seqs
+            cur_res["s_qo"] = 1
+            cur_res["num_q_heads"] = num_heads
+            cur_res["head_size"] = head_size
+            cur_res["input_dtype"] = str(input_dtype)
+            cur_res["state_dtype"] = args.state_dtype
+            cur_res["packed"] = True
+            cur_res["has_initial_state"] = True
             cur_res["case_tag"] = args.case_tag
             res.append(cur_res)
     return res

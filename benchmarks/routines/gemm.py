@@ -161,8 +161,14 @@ def parse_gemm_args(line, parser):
             "tinygemm",
             "cutile",
             "trtllm_low_latency",
+            "cutedsl_low_latency",
+            "blackwell-native",
+            "blackwell-tiled",
+            "cake",
+            "deepgemm",
         ],
-        help="Kernel backends to test. Default: cudnn",
+        help="Kernel backends to test. Default: cudnn (cutlass for the FP8 "
+        "groupwise routines, trtllm_low_latency for mm_fp8, cute-dsl for mm_bf16_fp4).",
     )
     parser.add_argument(
         "--use_128x4_sf_layout",
@@ -214,6 +220,9 @@ def parse_gemm_args(line, parser):
     if args.routine == "mm_fp8":
         if not has_backends_arg:
             args.backends = ["trtllm_low_latency"]
+    if args.routine in ("gemm_fp8_nt_groupwise", "group_gemm_fp8_nt_groupwise"):
+        if not has_backends_arg:
+            args.backends = ["cutlass"]
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -290,14 +299,23 @@ def testGemmFp8NtGroupwise(args):
             remove_trtllm = True
         if remove_trtllm:
             backends.remove("trtllm")
+    if "cutile" in backends and scale_major_mode != "K":
+        print("[INFO] cutile only supports K scale_major_mode, removing cutile")
+        backends.remove("cutile")
+    if "cake" in backends and (tile_size != 128 or n % 2 != 0):
+        print("[INFO] cake (Kimi-K3 FP8 projection) needs tile_size 128 and even n")
+        backends.remove("cake")
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
-        return
+        return res
 
     ## Prepare input tensors
+    # The kernels take ceil(n / tile_size) scale blocks; quantize_fp8 needs
+    # whole tiles, so quantize a padded B and keep its first n rows.
+    n_pad = -(-n // tile_size) * tile_size
     a_val = torch.randn((m, k), dtype=torch.float, device=device)
-    b_val = torch.randn((n, k), dtype=torch.float, device=device) / np.sqrt(k)
+    b_val = torch.randn((n_pad, k), dtype=torch.float, device=device) / np.sqrt(k)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {a_val.shape = }")
@@ -305,10 +323,10 @@ def testGemmFp8NtGroupwise(args):
 
     if scale_major_mode == "K":
         a_scale_shape = (m, k // tile_size)
-        b_scale_shape = (n // tile_size, k // tile_size)
+        b_scale_shape = (n_pad // tile_size, k // tile_size)
     else:
         a_scale_shape = (k // tile_size, m)
-        b_scale_shape = (k // tile_size, n // tile_size)
+        b_scale_shape = (k // tile_size, n_pad // tile_size)
 
     a_tile_shape = (1, tile_size)
     b_tile_shape = (tile_size, tile_size)
@@ -323,15 +341,41 @@ def testGemmFp8NtGroupwise(args):
         print(f"[VVERBOSE] {b_scale.shape = }")
 
     a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
-    b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
+    b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)[:n]
+    b_fp8_padded, b_fp8 = b_fp8, b_fp8[:n]
+    # trtllm takes the MN-major B scale transposed and contiguous.
+    b_scale_trtllm = b_scale.t().contiguous() if "trtllm" in backends else None
+
+    cake_runner = None
+    if "cake" in backends:
+        # Kimi-K3 FP8_PB_WO projection: BF16 activations, quantized to 1x128
+        # UE8M0 blocks inside the timed call; the weight is the same padded B
+        # with K-major [N_pad / 128, 1, K / 128, 1] block scales.
+        b_scale_k = b_scale if scale_major_mode == "K" else b_scale.t()
+        prepared = flashinfer.gemm.prepare_kimi_k3_fp8_projection_weights(
+            b_fp8_padded.contiguous(),
+            b_scale_k.contiguous().view(n_pad // 128, 1, k // 128, 1),
+            n,
+        )
+        cake_out = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+        # a_dequant is exact in BF16 and requantizes to the same FP8 blocks,
+        # so --refcheck compares like with like.
+        cake_runner = flashinfer.gemm.prepare_kimi_k3_fp8_projection(
+            a_dequant.to(torch.bfloat16),
+            prepared,
+            cake_out,
+            flashinfer.gemm.allocate_kimi_k3_fp8_projection_workspace(prepared, m),
+        )
 
     def run_backend(backend, a_fp8, b_fp8, a_scale, b_scale):
+        if backend == "cake":
+            return cake_runner()
         if backend in ["cutlass", "trtllm", "cutile"]:
             return flashinfer.gemm.gemm_fp8_nt_groupwise(
                 a=a_fp8,
                 b=b_fp8,
                 a_scale=a_scale,
-                b_scale=b_scale,
+                b_scale=b_scale_trtllm if backend == "trtllm" else b_scale,
                 scale_major_mode=scale_major_mode,
                 out_dtype=out_dtype,
                 mma_sm=mma_sm,
@@ -391,9 +435,12 @@ def testGemmFp8NtGroupwise(args):
             std_time = np.std(backend_times[backend])
 
             problem_flops = 2 * m * n * k
-            problem_bytes = (m * k + n * k) * torch.float8_e4m3fn.itemsize + (
-                m * n
-            ) * out_dtype.itemsize
+            a_itemsize = 2 if backend == "cake" else 1  # cake reads BF16 activations
+            problem_bytes = (
+                m * k * a_itemsize
+                + n * k * torch.float8_e4m3fn.itemsize
+                + m * n * out_dtype.itemsize
+            )
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
             print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
@@ -447,7 +494,7 @@ def testGroupGemmFp8NtGroupwise(args):
         )
 
     ## Parse input arguments
-    backends = ["cutlass"]  # Cutlass is currently the only supported backend
+    backends = args.backends
     m = args.m
     n = args.n
     k = args.k
@@ -467,12 +514,30 @@ def testGroupGemmFp8NtGroupwise(args):
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
     if out_dtype not in [torch.bfloat16, torch.float16]:
         raise ValueError(f"Unsupported output dtype: {args.out_dtype}")
+    # The per-row-index APIs (contiguous CuTe-DSL, DeepGEMM) take K-major
+    # scales, BF16 output and 128-row-aligned expert boundaries.
+    for backend in ("cutile", "cute-dsl", "deepgemm"):
+        if backend not in backends:
+            continue
+        if scale_major_mode != "K":
+            print(f"[INFO] {backend} only supports K scale_major_mode. Skipping.")
+            backends.remove(backend)
+        elif backend != "cutile" and (
+            out_dtype != torch.bfloat16 or (group_size > 1 and m % 128 != 0)
+        ):
+            print(f"[INFO] {backend} needs bfloat16 output and m % 128 == 0. Skipping.")
+            backends.remove(backend)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
     ## Done parsing input arguments
     ## Prepare input tensors
+    # Quantize a whole-tile padded B (quantize_fp8 needs it), keep n rows.
+    n_pad = -(-n // tile_size) * tile_size
     a_val = torch.randn((group_size * m, k), dtype=torch.float, device="cuda")
-    b_val = torch.randn((group_size, n, k), dtype=torch.float, device="cuda") / np.sqrt(
-        k
-    )
+    b_val = torch.randn(
+        (group_size, n_pad, k), dtype=torch.float, device="cuda"
+    ) / np.sqrt(k)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {a_val.shape = }")
@@ -480,10 +545,10 @@ def testGroupGemmFp8NtGroupwise(args):
 
     if scale_major_mode == "K":
         a_scale_shape = (group_size * m, k // tile_size)
-        b_scale_shape = (group_size, n // tile_size, k // tile_size)
+        b_scale_shape = (group_size, n_pad // tile_size, k // tile_size)
     else:
         a_scale_shape = (k // tile_size, m * group_size)
-        b_scale_shape = (group_size, k // tile_size, n // tile_size)
+        b_scale_shape = (group_size, k // tile_size, n_pad // tile_size)
 
     a_tile_shape = (1, tile_size)
     b_tile_shape = (1, tile_size, tile_size)
@@ -492,9 +557,13 @@ def testGroupGemmFp8NtGroupwise(args):
     b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, b_tile_shape, scale_major_mode)
 
     a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
-    b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
+    b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)[:, :n]
+    b_fp8 = b_fp8[:, :n].contiguous()
 
     m_indptr = torch.arange(0, group_size + 1, dtype=torch.int32, device="cuda") * m
+    m_indices = torch.arange(
+        group_size, dtype=torch.int32, device="cuda"
+    ).repeat_interleave(m)  # per-row expert ids for cute-dsl / deepgemm
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {a_fp8.shape = }")
@@ -504,7 +573,7 @@ def testGroupGemmFp8NtGroupwise(args):
         print(f"[VVERBOSE] {m_indptr.shape = }")
 
     def run_backend(backend, a_fp8, b_fp8, a_scale, b_scale, m_indptr):
-        if backend == "cutlass":
+        if backend in ("cutlass", "cutile"):
             return flashinfer.gemm.group_gemm_fp8_nt_groupwise(
                 a=a_fp8,
                 b=b_fp8,
@@ -514,6 +583,16 @@ def testGroupGemmFp8NtGroupwise(args):
                 scale_major_mode=scale_major_mode,
                 out_dtype=out_dtype,
                 mma_sm=mma_sm,
+                # The API's default backend ("trtllm") is the CUTLASS kernel.
+                backend="cutile" if backend == "cutile" else "trtllm",
+            )
+        elif backend == "cute-dsl":
+            return flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous(
+                a_fp8, b_fp8, a_scale, b_scale, m_indices
+            )
+        elif backend == "deepgemm":
+            return flashinfer.gemm.group_deepgemm_fp8_nt_groupwise(
+                a_fp8, b_fp8, a_scale, b_scale, m_indices
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -543,7 +622,8 @@ def testGroupGemmFp8NtGroupwise(args):
             repeat_iters=args.num_iters,
             sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
             enable_cupti=args.use_cupti,
-            use_cuda_graph=is_cuda_graph_compatible,
+            # DeepGEMM's launch invalidates CUDA-graph capture; time it eagerly.
+            use_cuda_graph=is_cuda_graph_compatible and cur_backend != "deepgemm",
             cold_l2_cache=True,
             input_args=(cur_backend, a_fp8, b_fp8, a_scale, b_scale, m_indptr),
         )
@@ -919,6 +999,11 @@ def testMmFp8(args):
     # layout. The dict memoizes the (expensive) permutation indices; a fresh one
     # is fine since weight prep runs once here, outside the timed region.
     mat2_prepared = flashinfer.prepare_low_latency_gemm_weights(mat2_fp8, {})
+
+    # cutedsl_low_latency takes the unshuffled (n, k) weight.
+    def weight_for(backend):
+        return mat2_fp8 if backend == "cutedsl_low_latency" else mat2_prepared
+
     alpha = (input_inv_s * mat2_inv_s).float()  # a_scale * b_scale
 
     if args.verbose >= 2:
@@ -940,7 +1025,7 @@ def testMmFp8(args):
         try:
             flashinfer.mm_fp8(
                 input_fp8,
-                mat2_prepared,
+                weight_for(backend),
                 alpha,
                 out_dtype=res_dtype,
                 backend=backend,
@@ -983,7 +1068,9 @@ def testMmFp8(args):
                     print(f"[INFO] Autotune warmup for mm_fp8: {warmup_iters} iters")
                 with autotune(True, cache=cache_path):
                     for _ in range(warmup_iters):
-                        run_backend(cur_backend, input_fp8, mat2_prepared, alpha)
+                        run_backend(
+                            cur_backend, input_fp8, weight_for(cur_backend), alpha
+                        )
     elif cache_path:
         with autotune(False, cache=cache_path):
             pass
@@ -994,7 +1081,7 @@ def testMmFp8(args):
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(
-                cur_backend, input_fp8, mat2_prepared, alpha
+                cur_backend, input_fp8, weight_for(cur_backend), alpha
             ).detach()
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
@@ -1004,7 +1091,7 @@ def testMmFp8(args):
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
             cold_l2_cache=True,
-            input_args=(cur_backend, input_fp8, mat2_prepared, alpha),
+            input_args=(cur_backend, input_fp8, weight_for(cur_backend), alpha),
         )
 
     tested_backends = list(outputs.keys())
@@ -1335,19 +1422,30 @@ def testMmFp4(args):
 
     input = torch.randn([m, k], device=device, dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device=device, dtype=torch.bfloat16)
-    a_sf_layout = (
-        flashinfer.SfLayout.layout_128x4
-        if use_128x4_sf_layout
-        else flashinfer.SfLayout.layout_8x4
-    )
+
+    # Only trtllm consumes the 8x4 activation-scale layout; every other backend
+    # needs 128x4, so --use_128x4_sf_layout only changes what trtllm gets.
+    def uses_8x4(backend):
+        return backend == "trtllm" and not use_128x4_sf_layout
 
     global_sf_input = (448 * 6) / input.float().abs().nan_to_num().max()
     global_sf_mat2 = (448 * 6) / mat2.float().abs().nan_to_num().max()
 
+    input_fp4_8x4, input_inv_s_8x4 = None, None
     if use_nvfp4:
         input_fp4, input_inv_s = flashinfer.nvfp4_quantize(
-            input, global_sf_input, sfLayout=a_sf_layout, do_shuffle=False
+            input,
+            global_sf_input,
+            sfLayout=flashinfer.SfLayout.layout_128x4,
+            do_shuffle=False,
         )
+        if any(uses_8x4(backend) for backend in backends):
+            input_fp4_8x4, input_inv_s_8x4 = flashinfer.nvfp4_quantize(
+                input,
+                global_sf_input,
+                sfLayout=flashinfer.SfLayout.layout_8x4,
+                do_shuffle=False,
+            )
         mat2_fp4, mat2_inv_s = flashinfer.nvfp4_quantize(
             mat2,
             global_sf_mat2,
@@ -1357,6 +1455,12 @@ def testMmFp4(args):
     else:  # mxfp4
         input_fp4, input_inv_s = flashinfer.mxfp4_quantize(input)
         mat2_fp4, mat2_inv_s = flashinfer.mxfp4_quantize(mat2)
+        input_fp4_8x4, input_inv_s_8x4 = input_fp4, input_inv_s
+
+    def a_inputs(backend):
+        if uses_8x4(backend):
+            return input_fp4_8x4, input_inv_s_8x4
+        return input_fp4, input_inv_s
 
     # The trtllm backend consumes a shuffled weight/scale layout. Prepare it
     # only when that backend is requested: the shuffle requires n to be a
@@ -1406,9 +1510,9 @@ def testMmFp4(args):
 
         try:
             flashinfer.gemm.mm_fp4(
-                a=input_fp4,
+                a=a_inputs(backend)[0],
                 b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
-                a_descale=input_inv_s,
+                a_descale=a_inputs(backend)[1],
                 b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
                 alpha=(
                     alpha_for_cute_dsl_mxfp4
@@ -1419,7 +1523,7 @@ def testMmFp4(args):
                 block_size=16
                 if use_nvfp4
                 else 32,  # nvfp4 only supports 16; mxfp4 only supports 32.
-                use_8x4_sf_layout=not use_128x4_sf_layout,
+                use_8x4_sf_layout=uses_8x4(backend),
                 backend=backend,
                 use_nvfp4=use_nvfp4,
                 enable_pdl=args.enable_pdl,
@@ -1457,7 +1561,7 @@ def testMmFp4(args):
             ),
             out_dtype=res_dtype,
             block_size=block_size,
-            use_8x4_sf_layout=not use_128x4_sf_layout,
+            use_8x4_sf_layout=uses_8x4(backend),
             backend=backend,
             use_nvfp4=use_nvfp4,
             enable_pdl=args.enable_pdl,
@@ -1480,10 +1584,10 @@ def testMmFp4(args):
                 for _ in range(warmup_iters):
                     run_backend(
                         cur_backend,
-                        input_fp4,
+                        a_inputs(cur_backend)[0],
                         mat2_fp4,
                         mat2_fp4_trtllm,
-                        input_inv_s,
+                        a_inputs(cur_backend)[1],
                         mat2_inv_s,
                         mat2_inv_s_trtllm,
                     )
@@ -1498,10 +1602,10 @@ def testMmFp4(args):
         if run_refcheck:
             outputs[cur_backend] = run_backend(
                 cur_backend,
-                input_fp4,
+                a_inputs(cur_backend)[0],
                 mat2_fp4,
                 mat2_fp4_trtllm,
-                input_inv_s,
+                a_inputs(cur_backend)[1],
                 mat2_inv_s,
                 mat2_inv_s_trtllm,
             ).detach()
@@ -1515,10 +1619,10 @@ def testMmFp4(args):
             cold_l2_cache=True,
             input_args=(
                 cur_backend,
-                input_fp4,
+                a_inputs(cur_backend)[0],
                 mat2_fp4,
                 mat2_fp4_trtllm,
-                input_inv_s,
+                a_inputs(cur_backend)[1],
                 mat2_inv_s,
                 mat2_inv_s_trtllm,
             ),
@@ -1574,7 +1678,7 @@ def testMmFp4(args):
                 cur_res["n"] = n
                 cur_res["k"] = k
                 cur_res["out_dtype"] = res_dtype
-                cur_res["use_128x4_sf_layout"] = use_128x4_sf_layout
+                cur_res["use_128x4_sf_layout"] = not uses_8x4(backend)
                 cur_res["backend"] = backend_name
                 cur_res["use_nvfp4"] = use_nvfp4
                 cur_res["case_tag"] = args.case_tag
@@ -1680,7 +1784,18 @@ def testMmBf16Fp4(args):
     # Per-backend prep + runner closures.  Prep is one-shot and not timed.
     backend_runners = {}
 
+    # The blackwell-* backends cache a TMA descriptor per tensor binding and
+    # cannot create one during graph capture, where bench_gpu_time rotates
+    # input copies: time them eagerly, with a fixed output.
+    eager_backends = ("blackwell-native", "blackwell-tiled")
+
     def make_runner(b_p, sf_p, alpha_p, backend):
+        out = (
+            torch.empty(m, n, device=device, dtype=out_dtype)
+            if backend in eager_backends
+            else None
+        )
+
         def run(a):
             # mm_bf16_fp4: bf16 activation a against the prepared FP4
             # weight; b_p/sf_p are prepare_bf16_fp4_weights outputs.
@@ -1691,6 +1806,7 @@ def testMmBf16Fp4(args):
                 alpha_p,
                 backend=backend,
                 out_dtype=out_dtype,
+                out=out,
                 block_size=16,
                 enable_pdl=args.enable_pdl,
             )
@@ -1772,7 +1888,7 @@ def testMmBf16Fp4(args):
             repeat_iters=args.num_iters,
             sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
             enable_cupti=args.use_cupti,
-            use_cuda_graph=is_cuda_graph_compatible,
+            use_cuda_graph=is_cuda_graph_compatible and backend not in eager_backends,
             cold_l2_cache=True,
             input_args=(a,),
         )
@@ -1924,9 +2040,14 @@ def testMmMxfp8(args):
         backend: str,
         inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        assert backend in ["cutlass", "trtllm", "cute-dsl", "cudnn", "auto"], (
-            f"Unsupported backend: {backend}"
-        )
+        assert backend in [
+            "cutlass",
+            "trtllm",
+            "cute-dsl",
+            "cutedsl_low_latency",
+            "cudnn",
+            "auto",
+        ], f"Unsupported backend: {backend}"
         input_mxfp8, mat2_mxfp8, input_scale, mat2_scale = inputs
         return flashinfer.gemm.mm_mxfp8(
             a=input_mxfp8,
@@ -2575,15 +2696,13 @@ def testBmmBf16(args):
         return res
 
     def run_backend(backend, A, B, out_dtype):
-        if backend in ["cudnn", "cutlass", "auto"]:
-            return flashinfer.bmm_bf16(
-                A=A,
-                B=B,
-                out_dtype=out_dtype,
-                backend=backend,
-            )
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+        # Every backend passed the trial call above.
+        return flashinfer.bmm_bf16(
+            A=A,
+            B=B,
+            out_dtype=out_dtype,
+            backend=backend,
+        )
 
     has_reference_output = False
     if run_refcheck:

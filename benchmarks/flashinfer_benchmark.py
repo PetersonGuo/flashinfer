@@ -4,19 +4,61 @@ import sys
 
 # Only import utilities at module level - routine modules are imported lazily
 # to avoid loading unnecessary dependencies (e.g., mpi4py for non-MPI benchmarks)
+from routines import flashinfer_benchmark_utils
 from routines.flashinfer_benchmark_utils import (
     benchmark_apis,
     full_output_columns,
 )
 
 
+def write_results(output_path, rows, args=None):
+    """Append result rows to the output CSV, backfilling unset columns from args."""
+    with open(output_path, "a", newline="") as fout:
+        writer = csv.writer(fout)
+        for cur_res in rows:
+            for key in full_output_columns:
+                # Backfill every output column the routine didn't set: from
+                # args when available, else "".  Covers columns belonging to
+                # other routines (e.g. attention's s_qo) that would otherwise
+                # KeyError below.  Routine-set values are preserved.
+                if key not in cur_res or cur_res[key] == "":
+                    cur_res[key] = getattr(args, key, "")
+            writer.writerow([str(cur_res[col]) for col in full_output_columns])
+        fout.flush()
+
+
 def run_test(args):
     """
-    Route & run a single FlashInfer test case with test routine.
+    Run a single FlashInfer test case and write its rows to args.output_path.
 
-    Args:
-        args: Parsed command line arguments containing test configuration
+    Besides the routine's measured rows, writes one row per backend the routine
+    skipped or that failed (see record_backend_status), and an "error: ..." row
+    if the routine raised, so every requested backend is accounted for in the CSV.
     """
+    flashinfer_benchmark_utils.backend_statuses.clear()
+    res = []
+    try:
+        res = _run_routine(args)
+    except Exception as e:
+        backends = getattr(args, "backends", None)
+        flashinfer_benchmark_utils.backend_statuses.append(
+            (
+                " ".join(backends) if isinstance(backends, list) else "",
+                f"error: {type(e).__name__}: {' '.join(str(e).split())}",
+            )
+        )
+        raise
+    finally:
+        if args.output_path is not None:
+            status_rows = [
+                {"routine": args.routine, "backend": backend, "status": status}
+                for backend, status in flashinfer_benchmark_utils.backend_statuses
+            ]
+            write_results(args.output_path, list(res) + status_rows, args)
+
+
+def _run_routine(args):
+    """Route a single FlashInfer test case to its test routine; return its rows."""
 
     ## Depending on routine type, route to corresponding test routine
     ## Imports are done lazily to avoid loading unnecessary dependencies
@@ -87,23 +129,7 @@ def run_test(args):
         res = run_sparse_attention_test(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
-
-    # Write results to output file if specified
-    if args.output_path is not None:
-        with open(args.output_path, "a", newline="") as fout:
-            writer = csv.writer(fout)
-            for cur_res in res:
-                for key in full_output_columns:
-                    # Backfill every output column the routine didn't set: from
-                    # args when available, else "".  Covers columns belonging to
-                    # other routines (e.g. attention's s_qo) that would otherwise
-                    # KeyError below.  Routine-set values are preserved.
-                    if key not in cur_res or cur_res[key] == "":
-                        cur_res[key] = getattr(args, key, "")
-
-                writer.writerow([str(cur_res[col]) for col in full_output_columns])
-            fout.flush()
-    return
+    return res
 
 
 def parse_args(line=sys.argv[1:]):
@@ -368,7 +394,18 @@ if __name__ == "__main__":
                     continue
                 try:
                     line_args = parse_args(shlex.split(line))
-                    line_args.output_path = testlist_args.output_path
+                except (Exception, SystemExit) as e:
+                    # argparse exits on bad flags; keep going and record the line.
+                    print(f"[ERROR] Error parsing test: {line}")
+                    print(f"[ERROR] Error: {e!r}")
+                    if testlist_args.output_path is not None:
+                        write_results(
+                            testlist_args.output_path,
+                            [{"status": f"error: invalid test line: {line}"}],
+                        )
+                    continue
+                line_args.output_path = testlist_args.output_path
+                try:
                     run_test(line_args)
                 except Exception as e:
                     print(f"[ERROR] Error running test: {line}")

@@ -193,8 +193,19 @@ def parse_rope_args(line, parser):
         required=False,
         nargs="+",
         default=["cuda"],
-        choices=["cuda"],
-        help="Kernel backends to test. Default: cuda",
+        choices=["cuda", "cutile"],
+        help=(
+            "Kernel backends to test. Default: cuda. cutile is supported by "
+            "mla_rope_quantize_fp8 with --interleave."
+        ),
+    )
+    parser.add_argument(
+        "--mla",
+        action="store_true",
+        help=(
+            "rope_quantize_fp8_append_paged_kv_cache only: use the MLA form "
+            "(2-D K, (ckv, kpe) paged cache, no V); num_kv_heads is ignored."
+        ),
     )
 
     args = parser.parse_args(line)
@@ -1015,6 +1026,9 @@ def testMlaRopeQuantizeFp8(args):
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if "cutile" in backends and not interleave:
+        print("[INFO] cutile backend supports --interleave (GPT-J) only. Skipping.")
+        backends.remove("cutile")
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
@@ -1085,6 +1099,20 @@ def testMlaRopeQuantizeFp8(args):
                 is_neox=is_neox,
                 quantize_dtype=quant_dtype,
                 enable_pdl=args.enable_pdl,
+            )
+        elif backend == "cutile":
+            # mla_rope_quantize_fp8 has no backend argument; it forwards to
+            # rope_quantize_fp8, which takes the same MLA (2-D K) tensors.
+            return flashinfer.rope.rope_quantize_fp8(
+                q_rope,
+                k_rope,
+                q_nope,
+                k_nope,
+                cos_sin_cache,
+                pos_ids,
+                is_neox=is_neox,
+                quantize_dtype=quant_dtype,
+                backend="cutile",
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -1433,10 +1461,14 @@ def testRopeQuantizeFp8AppendPagedKvCache(args):
     num_kv_heads = args.num_kv_heads
     head_dim = args.head_dim
     rotary_dim = args.rotary_dim
-    no_rope_dim = head_dim - rotary_dim  # For GQA/MHA
+    no_rope_dim = head_dim - rotary_dim
     interleave = args.interleave
     page_size = args.page_size
-    kv_layout = args.kv_layout
+    # MLA: K has no head axis, the cache is (ckv, kpe) and there is no V.
+    is_mla = args.mla
+    if is_mla:
+        num_kv_heads = 1
+    kv_layout = "MLA" if is_mla else args.kv_layout
     is_cuda_graph_compatible = not args.no_cuda_graph
     res = []
 
@@ -1456,9 +1488,10 @@ def testRopeQuantizeFp8AppendPagedKvCache(args):
     q_rope = torch.randn(
         total_tokens, num_qo_heads, rotary_dim, dtype=input_dtype, device=device
     )
-    # k_rope: (total_tokens, num_kv_heads, rotary_dim)
+    # k_rope: (total_tokens, num_kv_heads, rotary_dim); MLA: (total_tokens, rotary_dim)
+    k_head_shape = () if is_mla else (num_kv_heads,)
     k_rope = torch.randn(
-        total_tokens, num_kv_heads, rotary_dim, dtype=input_dtype, device=device
+        total_tokens, *k_head_shape, rotary_dim, dtype=input_dtype, device=device
     )
     # q_nope: (total_tokens, num_qo_heads, no_rope_dim) or None
     q_nope = (
@@ -1468,17 +1501,21 @@ def testRopeQuantizeFp8AppendPagedKvCache(args):
         if no_rope_dim > 0
         else None
     )
-    # k_nope: (total_tokens, num_kv_heads, no_rope_dim) or None
+    # k_nope: (total_tokens, num_kv_heads, no_rope_dim) or None; MLA: 2-D
     k_nope = (
         torch.randn(
-            total_tokens, num_kv_heads, no_rope_dim, dtype=input_dtype, device=device
+            total_tokens, *k_head_shape, no_rope_dim, dtype=input_dtype, device=device
         )
         if no_rope_dim > 0
         else None
     )
-    # v: (total_tokens, num_kv_heads, head_dim)
-    v = torch.randn(
-        total_tokens, num_kv_heads, head_dim, dtype=input_dtype, device=device
+    # v: (total_tokens, num_kv_heads, head_dim); MLA has no V
+    v = (
+        None
+        if is_mla
+        else torch.randn(
+            total_tokens, num_kv_heads, head_dim, dtype=input_dtype, device=device
+        )
     )
 
     # Precomputed cos_sin_cache: (max_seq_len, rotary_dim) in float32
@@ -1493,7 +1530,15 @@ def testRopeQuantizeFp8AppendPagedKvCache(args):
     # Note: FP8 tensors cannot be created with randn, use empty instead
     num_pages_per_request = (seq_len + page_size - 1) // page_size
     total_pages = batch_size * num_pages_per_request
-    if kv_layout == "NHD":
+    if is_mla:
+        # (ckv_cache, kpe_cache)
+        k_cache = torch.empty(
+            total_pages, page_size, no_rope_dim, dtype=quant_dtype, device=device
+        )
+        v_cache = torch.empty(
+            total_pages, page_size, rotary_dim, dtype=quant_dtype, device=device
+        )
+    elif kv_layout == "NHD":
         k_cache = torch.empty(
             total_pages,
             page_size,
@@ -1563,7 +1608,7 @@ def testRopeQuantizeFp8AppendPagedKvCache(args):
         print(
             f"[VVERBOSE] k_nope.shape = {k_nope.shape if k_nope is not None else None}"
         )
-        print(f"[VVERBOSE] {v.shape = }")
+        print(f"[VVERBOSE] v.shape = {v.shape if v is not None else None}")
         print(f"[VVERBOSE] {cos_sin_cache.shape = }")
         print(f"[VVERBOSE] {pos_ids.shape = }")
         print(f"[VVERBOSE] k_cache.shape = {k_cache.shape}")
@@ -1610,7 +1655,7 @@ def testRopeQuantizeFp8AppendPagedKvCache(args):
                 is_neox=is_neox,
                 quantize_dtype=quant_dtype,
                 page_size=page_size,
-                kv_layout=kv_layout,
+                kv_layout=args.kv_layout,
                 enable_pdl=args.enable_pdl,
             )
         else:
@@ -1675,9 +1720,7 @@ def testRopeQuantizeFp8AppendPagedKvCache(args):
                 * num_kv_heads
                 * rotary_dim
                 * input_dtype.itemsize  # k_rope read
-                + total_tokens
-                * num_kv_heads
-                * head_dim
+                + (0 if is_mla else total_tokens * num_kv_heads * head_dim)
                 * input_dtype.itemsize  # v read
                 + nope_bytes
                 + max_seq_len * rotary_dim * 4  # cos_sin_cache read (float32)
@@ -1690,7 +1733,7 @@ def testRopeQuantizeFp8AppendPagedKvCache(args):
                 * num_kv_heads
                 * head_dim
                 * quant_dtype.itemsize
-                * 2  # k, v to paged cache
+                * (1 if is_mla else 2)  # k (ckv + kpe for MLA), v to paged cache
             )
             tflops = 0  # Memory-bound operation
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
